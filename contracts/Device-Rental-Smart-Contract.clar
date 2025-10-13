@@ -242,3 +242,98 @@
 (define-read-only (has-user-rated-device (device-id uint) (user principal))
     (is-some (map-get? device-ratings { device-id: device-id, renter: user }))
 )
+
+
+(define-map device-pricing-strategy
+    { device-id: uint }
+    {
+        base-rate: uint,
+        peak-multiplier: uint,
+        off-peak-multiplier: uint,
+        enabled: bool
+    }
+)
+
+(define-map time-based-rates
+    { device-id: uint, period-start: uint }
+    { rate-multiplier: uint }
+)
+
+(define-constant price-scale u100)
+
+(define-public (configure-dynamic-pricing 
+    (device-id uint) 
+    (base-rate uint) 
+    (peak-multiplier uint) 
+    (off-peak-multiplier uint))
+    (let ((device (unwrap! (map-get? devices { device-id: device-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get owner device)) err-unauthorized)
+        (asserts! (and (>= peak-multiplier u100) (<= peak-multiplier u300)) err-invalid-rating)
+        (asserts! (and (>= off-peak-multiplier u50) (<= off-peak-multiplier u100)) err-invalid-rating)
+        (map-set device-pricing-strategy
+            { device-id: device-id }
+            {
+                base-rate: base-rate,
+                peak-multiplier: peak-multiplier,
+                off-peak-multiplier: off-peak-multiplier,
+                enabled: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-dynamic-pricing (device-id uint) (enabled bool))
+    (let (
+        (device (unwrap! (map-get? devices { device-id: device-id }) err-not-found))
+        (strategy (unwrap! (map-get? device-pricing-strategy { device-id: device-id }) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get owner device)) err-unauthorized)
+        (map-set device-pricing-strategy
+            { device-id: device-id }
+            (merge strategy { enabled: enabled })
+        )
+        (ok enabled)
+    )
+)
+
+(define-read-only (calculate-dynamic-rate (device-id uint) (rental-days uint))
+    (let (
+        (device (unwrap! (map-get? devices { device-id: device-id }) err-not-found))
+        (strategy-opt (map-get? device-pricing-strategy { device-id: device-id }))
+    )
+        (match strategy-opt
+            strategy (if (get enabled strategy)
+                (let (
+                    (current-day-of-week (mod (/ stacks-block-height u144) u7))
+                    (is-weekend (or (is-eq current-day-of-week u5) (is-eq current-day-of-week u6)))
+                    (multiplier (if is-weekend (get peak-multiplier strategy) (get off-peak-multiplier strategy)))
+                    (adjusted-rate (/ (* (get base-rate strategy) multiplier) price-scale))
+                )
+                    (ok (* adjusted-rate rental-days))
+                )
+                (ok (* (get daily-rate device) rental-days))
+            )
+            (ok (* (get daily-rate device) rental-days))
+        )
+    )
+)
+
+(define-read-only (get-current-rate-multiplier (device-id uint))
+    (match (map-get? device-pricing-strategy { device-id: device-id })
+        strategy (if (get enabled strategy)
+            (let (
+                (current-day-of-week (mod (/ stacks-block-height u144) u7))
+                (is-weekend (or (is-eq current-day-of-week u5) (is-eq current-day-of-week u6)))
+            )
+                (some (if is-weekend (get peak-multiplier strategy) (get off-peak-multiplier strategy)))
+            )
+            (some price-scale)
+        )
+        none
+    )
+)
+
+(define-read-only (get-pricing-strategy (device-id uint))
+    (map-get? device-pricing-strategy { device-id: device-id })
+)

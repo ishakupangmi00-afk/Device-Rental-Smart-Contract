@@ -12,6 +12,16 @@
 (define-constant err-already-rated (err u109))
 (define-constant err-no-completed-rental (err u110))
 
+(define-constant err-dispute-exists (err u111))
+(define-constant err-dispute-not-found (err u112))
+(define-constant err-dispute-window-closed (err u113))
+(define-constant err-dispute-already-resolved (err u114))
+(define-constant err-no-rental-history (err u115))
+
+(define-constant dispute-window-blocks u288)
+(define-constant dispute-response-window u720)
+(define-constant renter-partial-refund-percent u70)
+
 (define-map devices
     { device-id: uint }
     {
@@ -336,4 +346,90 @@
 
 (define-read-only (get-pricing-strategy (device-id uint))
     (map-get? device-pricing-strategy { device-id: device-id })
+)
+
+
+(define-map device-disputes
+    { device-id: uint, renter: principal }
+    {
+        reason: (string-ascii 256),
+        filed-at-block: uint,
+        status: (string-ascii 24),
+        refund-amount: uint,
+        owner-responded: bool
+    }
+)
+
+(define-map rental-history
+    { device-id: uint, renter: principal }
+    { returned-at-block: uint, deposit-amount: uint }
+)
+
+(define-public (record-rental-completion (device-id uint) (renter principal) (deposit uint))
+    (let ((device (unwrap! (map-get? devices { device-id: device-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get owner device)) err-unauthorized)
+        (map-set rental-history
+            { device-id: device-id, renter: renter }
+            { returned-at-block: stacks-block-height, deposit-amount: deposit }
+        )
+        (ok true)
+    )
+)
+
+(define-public (file-dispute (device-id uint) (reason (string-ascii 256)))
+    (let (
+        (dispute-key { device-id: device-id, renter: tx-sender })
+        (history (unwrap! (map-get? rental-history dispute-key) err-no-rental-history))
+        (blocks-since-return (- stacks-block-height (get returned-at-block history)))
+    )
+        (asserts! (is-none (map-get? device-disputes dispute-key)) err-dispute-exists)
+        (asserts! (<= blocks-since-return dispute-window-blocks) err-dispute-window-closed)
+        (map-set device-disputes dispute-key {
+            reason: reason,
+            filed-at-block: stacks-block-height,
+            status: "pending",
+            refund-amount: u0,
+            owner-responded: false
+        })
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (device-id uint) (renter principal) (in-favor-of-renter bool))
+    (let (
+        (device (unwrap! (map-get? devices { device-id: device-id }) err-not-found))
+        (dispute-key { device-id: device-id, renter: renter })
+        (dispute (unwrap! (map-get? device-disputes dispute-key) err-dispute-not-found))
+        (history (unwrap! (map-get? rental-history dispute-key) err-no-rental-history))
+        (refund (if in-favor-of-renter (/ (* (get deposit-amount history) renter-partial-refund-percent) u100) u0))
+    )
+        (asserts! (is-eq tx-sender (get owner device)) err-unauthorized)
+        (asserts! (is-eq (get status dispute) "pending") err-dispute-already-resolved)
+        (if in-favor-of-renter
+            (try! (as-contract (stx-transfer? refund tx-sender renter)))
+            true
+        )
+        (map-set device-disputes dispute-key
+            (merge dispute {
+                status: (if in-favor-of-renter "resolved-favor-renter" "resolved-favor-owner"),
+                refund-amount: refund,
+                owner-responded: true
+            })
+        )
+        (ok refund)
+    )
+)
+
+(define-read-only (get-dispute (device-id uint) (renter principal))
+    (map-get? device-disputes { device-id: device-id, renter: renter })
+)
+
+(define-read-only (check-auto-resolve-eligible (device-id uint) (renter principal))
+    (match (map-get? device-disputes { device-id: device-id, renter: renter })
+        dispute (and
+            (is-eq (get status dispute) "pending")
+            (> (- stacks-block-height (get filed-at-block dispute)) dispute-response-window)
+        )
+        false
+    )
 )
